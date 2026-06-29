@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Cheese</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root { --paper: #f0ead6; --ink: #2b2b2b; --cheese: #ffcc00; }
+        body { font-family: 'Courier New', Courier, monospace; background-color: #333; color: white; display: flex; flex-direction: column; align-items: center; margin: 0; overflow: hidden; }
+        
+        #lobby { width: 100%; height: 100vh; background: #222; display: flex; flex-direction: column; align-items: center; justify-content: center; position: absolute; z-index: 100; }
+        #game-container { width: 1000px; height: 750px; background-color: var(--paper); color: var(--ink); border: 8px solid #5d4037; position: relative; margin-top: 5px; display: none; }
+        
+        /* Win/Loss Overlay */
+        #game-over { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 200; flex-direction: column; justify-content: center; align-items: center; color: var(--cheese); }
+
+        .stats-bar { padding: 8px; background: rgba(255,255,255,0.7); border-bottom: 2px solid var(--ink); display: flex; justify-content: space-around; font-weight: bold; cursor: default; }
+        .stats-bar.targetable { background: #ffcdd2; cursor: crosshair; border: 2px solid red; }
+
+        #battlefield { height: 300px; display: flex; justify-content: space-around; align-items: center; padding: 10px; }
+        .side { width: 45%; height: 100%; border: 2px dashed #999; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px; padding: 10px; border-radius: 5px; background: rgba(0,0,0,0.02); }
+        
+        .land-zone { height: 60px; width: 90%; margin: 5px auto; border-top: 1px solid #ccc; display: flex; justify-content: center; gap: 10px; align-items: center; }
+        .land-card { width: 70px; height: 45px; background: #d7ccc8; border: 1px solid #5d4037; font-size: 8px; text-align: center; border-radius: 3px; padding: 2px; }
+
+        #hand { height: 160px; background: rgba(0,0,0,0.1); display: flex; justify-content: center; gap: 10px; position: absolute; bottom: 0; width: 100%; padding: 10px; }
+        
+        .card { width: 100px; height: 140px; background: white; border: 2px solid black; padding: 5px; font-size: 9px; display: flex; flex-direction: column; cursor: pointer; border-radius: 5px; }
+        .card img { width: 100%; height: 50px; background: #eee; object-fit: cover; margin-bottom: 2px; }
+        
+        .unit-card { width: 75px; height: 95px; background: #e8f5e9; border: 2px solid #2e7d32; font-size: 9px; text-align: center; border-radius: 5px; cursor: pointer; position: relative;}
+        .unit-card.stunned { filter: grayscale(1) opacity(0.5); border-color: blue; }
+        .unit-card.burning { border-color: orange; box-shadow: 0 0 8px orange; }
+        .unit-card.bound { border: 3px solid purple; background: #f3e5f5; }
+
+        #status-msg { position: absolute; top: 40%; width: 100%; text-align: center; font-size: 35px; opacity: 0.2; pointer-events: none; color: black; font-weight: bold; }
+        button { padding: 10px 20px; background: var(--cheese); border: 2px solid black; cursor: pointer; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="lobby">
+        <h1>Cheese</h1>
+        <input type="text" id="room-input" placeholder="Room Code">
+        <button onclick="joinGame()">JOIN GAME</button>
+    </div>
+
+    <div id="game-container">
+        <div id="game-over">
+            <h1 id="result-text">YOU WIN!</h1>
+            <button onclick="location.reload()">PLAY AGAIN</button>
+        </div>
+
+        <div id="status-msg">WAITING...</div>
+        
+        <div id="opp-stats" class="stats-bar">
+            <span>OPPONENT HP: <span id="opp-hp">20</span> | CHEESE: <span id="opp-cheese">0</span></span>
+        </div>
+
+        <div id="battlefield">
+            <div id="opp-board" class="side"></div>
+            <div id="my-board" class="side"></div>
+        </div>
+
+        <div class="land-zone" id="opp-lands"></div>
+        <div class="land-zone" id="my-lands"></div>
+
+        <div id="my-stats" class="stats-bar">
+            <span>MY HP: <span id="my-hp">20</span> | MANA: <span id="my-mana">5</span></span>
+            <span>MY CHEESE: <span id="my-cheese">0</span>/10</span>
+            <button id="turn-btn" onclick="endTurn()">END TURN</button>
+        </div>
+
+        <div id="hand"></div>
+    </div>
+
+<script>
+    const socket = io();
+    let myNum = 0;
+    let activePlayer = 1;
+    let roomCode = "";
+    let mySessionDeck = [];
+    let targetingAction = null;
+    let isGameOver = false;
+
+    const CARD_LIB = [
+        { name: "Crafted Sword", type: "Weapon", cost: 1, dmg: 2, desc: "fragile and sticky, Deal 2 dmg.", pic: "" },
+        { name: "Pipe", type: "Weapon", cost: 2, dmg: 4, desc: "took it off the sink, Deal 4 dmg.", pic: "" },
+        { name: "Cockroach", type: "Unit", cost: 2, hp: 4, dmg: 1, desc: "such a common creature.", pic: "" },
+        { name: "Bread", type: "Artifact", cost: 1, heal: 3, desc: "Heal 3 HP (Max 20).", pic: "" },
+        { name: "Brick", type: "Artifact", cost: 2, effect: "flip", desc: "Flip a coin: Dmg 3 or Block 3.", pic: "" },
+        { name: "Turtle", type: "Unit", cost: 3, hp: 10, desc: "smells horrible", pic: "" },
+        { name: "Metal Spoon", type: "Shield", cost: 3, block: 4, desc: "Block 4 dmg.", pic: "" },
+        { name: "Guitar", type: "Artifact", cost: 1, effect: "buff", desc: "All weapons +1 dmg.", pic: "" },
+        { name: "Tape", type: "Artifact", cost: 2, effect: "skip", desc: "Skip opponent's turn.", pic: "" },
+        { name: "Monkey", type: "Unit", cost: 2, hp: 3, desc: "Willson smuggled goods", pic: "" },
+        { name: "Tissue", type: "Artifact", cost: 2, effect: "target_heal", heal: 1, desc: "Heals 1 HP.", pic: "" },
+        { name: "Lighter", type: "Artifact", cost: 2, effect: "target_burn", desc: "Target burns for 1 dmg.", pic: "" },
+        { name: "Trigonometry", type: "Spell", cost: 2, effect: "target_stun", desc: "Stun a target unit.", pic: "" },
+        { name: "Wall", type: "Unit", cost: 4, hp: 99, desc: "Block 2 dmg.", pic: "" },
+        { name: "Toilet Cap", type: "Artifact", cost: 5, effect: "win", desc: "Flip 5 coins, all heads = win.", pic: "" },
+        { name: "寶兒", type: "Spell", cost: 10, effect: "wipe", desc: "Destroy all units.", pic: "" },
+        { name: "Retroid Pocket", type: "Artifact", cost: 4, effect: "draw", desc: "Draw card.", pic: "" },
+        { name: "3D Printer", type: "Land", cost: 1, desc: "Summon a token.", pic: "" },
+        { name: "Forbidden Chair", type: "Land", cost: 4, effect: "target_bind", desc: "Bind a unit.", pic: "" },
+        { name: "Student", type: "Unit", cost: 0, hp: 2, dmg: 1, desc: "Deal 1 dmg.", pic: "" },
+        { name: "Cilantro", type: "Spell", cost: 2, heal: 2, desc: "Heal 2.", pic: "" }
+    ];
+
+    function generateRandomDeck() {
+        let deck = [];
+        let studentCard = CARD_LIB.find(c => c.name === "Student");
+        for(let i=0; i<3; i++) deck.push({...studentCard, instanceId: Math.random()});
+        let others = CARD_LIB.filter(c => c.name !== "Student").sort(() => 0.5 - Math.random());
+        let slice = others.slice(0, 12).map(c => ({...c, instanceId: Math.random()}));
+        return [...deck, ...slice].sort(() => 0.5 - Math.random());
+    }
+
+    function joinGame() {
+        roomCode = document.getElementById('room-input').value;
+        if (!roomCode) return;
+        mySessionDeck = generateRandomDeck();
+        document.getElementById('lobby').style.display = 'none';
+        document.getElementById('game-container').style.display = 'block';
+        socket.emit('joinRoom', { roomCode: roomCode });
+    }
+
+    socket.on('playerAssign', (data) => {
+        myNum = data.num;
+        gameState = data.state;
+        if (gameState[`p${myNum}`].hand.length === 0) {
+            for(let i=0; i<3; i++) drawFromSessionDeck();
+            socket.emit('playCard', { room: roomCode, newState: gameState });
+        }
+        updateUI();
+    });
+
+    function drawFromSessionDeck() {
+        const me = gameState[`p${myNum}`];
+        if (mySessionDeck.length > 0 && me.hand.length < 8) {
+            me.hand.push(mySessionDeck.pop());
+        }
+    }
+
+    function updateUI() {
+        if (!gameState) return;
+        const me = gameState[`p${myNum}`];
+        const opp = gameState[`p${myNum === 1 ? 2 : 1}`];
+
+        // Win/Loss Detection
+        if (me.hp <= 0 && !isGameOver) {
+            isGameOver = true;
+            document.getElementById('game-over').style.display = 'flex';
+            document.getElementById('result-text').innerText = "DETENTION! (YOU LOSE)";
+        } else if (opp.hp <= 0 && !isGameOver) {
+            isGameOver = true;
+            document.getElementById('game-over').style.display = 'flex';
+            document.getElementById('result-text').innerText = "CHEESE MASTER! (YOU WIN)";
+        }
+
+        document.getElementById('my-hp').innerText = me.hp;
+        document.getElementById('my-mana').innerText = me.mana;
+        document.getElementById('my-cheese').innerText = me.cheese;
+        document.getElementById('opp-hp').innerText = opp.hp;
+        document.getElementById('opp-cheese').innerText = opp.cheese;
+
+        document.getElementById('opp-stats').className = targetingAction ? 'stats-bar targetable' : 'stats-bar';
+        document.getElementById('opp-stats').onclick = targetingAction ? () => applyTarget(false, 'player') : null;
+
+        const handDiv = document.getElementById('hand');
+        handDiv.innerHTML = '';
+        me.hand.forEach((card, i) => {
+            const div = document.createElement('div');
+            div.className = 'card';
+            div.innerHTML = `<img src="${card.pic || 'https://placehold.co/100x50?text=Card'}"><b>${card.name}</b><small>Cost: ${card.cost}</small><i>${card.desc}</i>`;
+            div.onclick = () => playCard(i);
+            handDiv.appendChild(div);
+        });
+
+        renderBoard('my-board', me.board, true);
+        renderBoard('opp-board', opp.board, false);
+        renderLands('my-lands', me.board);
+        renderLands('opp-lands', opp.board);
+
+        document.getElementById('status-msg').innerText = (activePlayer === myNum) ? (targetingAction ? "SELECT TARGET" : "YOUR TURN") : "OPPONENT'S TURN";
+    }
+
+    function renderBoard(id, units, isMine) {
+        const div = document.getElementById(id);
+        div.innerHTML = "";
+        units.filter(u => u.type === "Unit").forEach((u, i) => {
+            const uDiv = document.createElement('div');
+            uDiv.className = `unit-card ${u.stunned ? 'stunned' : ''} ${u.burning ? 'burning' : ''} ${u.bound ? 'bound' : ''}`;
+            uDiv.innerHTML = `<b>${u.name}</b><br>HP: ${u.hp}`;
+            if (targetingAction) uDiv.onclick = () => applyTarget(isMine, i);
+            div.appendChild(uDiv);
+        });
+    }
+
+    function renderLands(id, units) {
+        const div = document.getElementById(id);
+        div.innerHTML = "";
+        units.filter(u => u.type === "Land").forEach(l => {
+            div.innerHTML += `<div class="land-card">${l.name}</div>`;
+        });
+    }
+
+    function playCard(index) {
+        if (activePlayer !== myNum || targetingAction || isGameOver) return;
+        const me = gameState[`p${myNum}`];
+        const card = me.hand[index];
+
+        if (me.mana < card.cost) return alert("Not enough mana!");
+        if (card.type === "Land" && me.board.filter(u => u.type === "Land").length >= 2) return alert("Max 2 Lands!");
+
+        me.mana -= card.cost;
+        me.hand.splice(index, 1);
+
+        if (card.effect && card.effect.startsWith("target_")) {
+            targetingAction = card.effect;
+            updateUI();
+            return;
+        }
+
+        if (card.type === "Unit" || card.type === "Land") {
+            me.board.push({...card, stunned: false, burning: false, bound: false});
+        } else if (card.name === "Toilet Cap") {
+            runToiletCap();
+        } else if (card.dmg) {
+            gameState[`p${myNum === 1 ? 2 : 1}`].hp -= card.dmg;
+            me.cheese += card.dmg;
+        } else if (card.heal) {
+            me.hp = Math.min(20, me.hp + card.heal);
+        }
+
+        socket.emit('playCard', { room: roomCode, newState: gameState });
+        updateUI();
+    }
+
+    function applyTarget(isMine, unitIdx) {
+        const targetSide = isMine ? gameState[`p${myNum}`] : gameState[`p${myNum === 1 ? 2 : 1}`];
+        
+        if (unitIdx === 'player') {
+            if (targetingAction === "target_burn") targetSide.burning = true;
+            if (targetingAction === "target_heal") targetSide.hp = Math.min(20, targetSide.hp + 1);
+        } else {
+            const unitList = targetSide.board.filter(u => u.type === "Unit");
+            const targetUnit = unitList[unitIdx];
+            if (targetingAction === "target_stun") targetUnit.stunned = true;
+            if (targetingAction === "target_burn") targetUnit.burning = true;
+            if (targetingAction === "target_bind") targetUnit.bound = true;
+        }
+
+        targetingAction = null;
+        socket.emit('playCard', { room: roomCode, newState: gameState });
+        updateUI();
+    }
+
+    async function runToiletCap() {
+        let heads = 0;
+        for(let i=1; i<=5; i++) {
+            let res = Math.random() > 0.5 ? "HEADS" : "TAILS";
+            alert(`Flip ${i}: ${res}`);
+            if (res === "HEADS") heads++;
+        }
+        if (heads === 5) {
+            alert("5 HEADS! YOU WIN!");
+            gameState[`p${myNum === 1 ? 2 : 1}`].hp = -1; // Trigger GameOver
+        } else {
+            alert(`Only ${heads}/5 Heads. Fail.`);
+        }
+        socket.emit('playCard', { room: roomCode, newState: gameState });
+    }
+
+    function endTurn() {
+        if (activePlayer !== myNum || isGameOver) return;
+        activePlayer = (myNum === 1 ? 2 : 1);
+        socket.emit('endTurn', roomCode);
+        updateUI();
+    }
+
+    socket.on('opponentEndTurn', () => {
+        activePlayer = myNum;
+        const me = gameState[`p${myNum}`];
+        const opp = gameState[`p${myNum === 1 ? 2 : 1}`];
+        
+        me.mana += 2;
+        // DRAW 2 PER TURN
+        drawFromSessionDeck();
+        drawFromSessionDeck();
+        
+        me.board.forEach(l => {
+            if (l.name === "3D Printer" && me.board.length < 8) {
+                me.board.push({ name: "3D Plastic", type: "Unit", hp: 1, dmg: 1 });
+            }
+        });
+
+        if (me.burning) me.hp -= 1;
+
+        me.board.forEach(u => {
+            if (u.type === "Unit") {
+                if (!u.stunned && !u.bound) {
+                    opp.hp -= u.dmg || 0;
+                    me.cheese += u.dmg || 0;
+                }
+                if (u.burning && !u.bound) u.hp -= 1;
+                u.stunned = false; 
+            }
+        });
+
+        me.board = me.board.filter(u => u.type !== "Unit" || u.hp > 0);
+        socket.emit('playCard', { room: roomCode, newState: gameState });
+        updateUI();
+    });
+
+    socket.on('opponentMove', (data) => {
+        gameState = data.newState;
+        updateUI();
+    });
+</script>
+</body>
+</html>
